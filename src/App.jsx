@@ -28,6 +28,7 @@ export default function App() {
   // Estados del formulario
   const [act1, setAct1] = useState('');
   const [act2, setAct2] = useState('');
+  const [saveStatusText, setSaveStatusText] = useState('Firmar y Enviar a Sheet'); // Texto dinámico para el botón
 
   // Búsqueda en Google Sheets real
   const handleSearch = async (e) => {
@@ -64,7 +65,7 @@ export default function App() {
     }
   };
 
-  // Guardado en Google Sheets real
+  // Guardado en Google Sheets real con REINTENTOS AUTOMÁTICOS (Para Alta Concurrencia)
   const handleSave = async (e) => {
     e.preventDefault();
     if (!act1.trim() || !act2.trim()) {
@@ -74,35 +75,55 @@ export default function App() {
 
     setLoading(true);
     setError('');
+    setSaveStatusText('Enviando...');
 
-    try {
-      const response = await fetch(SCRIPT_URL, {
-        method: 'POST',
-        redirect: 'follow',
-        headers: {
-          // Usamos text/plain para evitar errores de preflight (CORS) con Apps Script
-          'Content-Type': 'text/plain;charset=utf-8',
-        },
-        body: JSON.stringify({
-          rowIndex: instructorData.rowIndex,
-          act1: act1.trim(),
-          act2: act2.trim()
-        })
-      });
-      
-      const result = await response.json();
+    const maxRetries = 4; // Intentará hasta 4 veces si hay tráfico pesado
+    const baseDelay = 1500; // 1.5 segundos de espera base
 
-      if (result.status === 'success') {
-        setStep('success');
-      } else {
-        setError('Error al guardar: ' + (result.detail || 'Desconocido'));
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+      try {
+        if (attempt > 0) {
+          setSaveStatusText(`Tráfico alto. Reintentando (${attempt}/${maxRetries - 1})...`);
+        }
+
+        const response = await fetch(SCRIPT_URL, {
+          method: 'POST',
+          redirect: 'follow',
+          headers: {
+            'Content-Type': 'text/plain;charset=utf-8',
+          },
+          body: JSON.stringify({
+            rowIndex: instructorData.rowIndex,
+            act1: act1.trim(),
+            act2: act2.trim()
+          })
+        });
+        
+        const result = await response.json();
+
+        if (result.status === 'success') {
+          setLoading(false);
+          setStep('success');
+          return; // Éxito, salimos de la función
+        } else {
+          // Si el Apps Script arroja error de bloqueo, lo tratamos como falla para reintentar
+          throw new Error(result.detail || 'Error en el servidor de Google');
+        }
+      } catch (err) {
+        console.warn(`Intento ${attempt + 1} fallido:`, err.message);
+        
+        // Si es el último intento, mostramos el error final
+        if (attempt === maxRetries - 1) {
+          setError('El sistema está experimentando un tráfico inusualmente alto. Por favor, intenta hacer clic en Guardar nuevamente en unos segundos.');
+        } else {
+          // Espera exponencial: 1.5s, luego 3s, luego 4.5s... antes de volver a intentar
+          await new Promise(resolve => setTimeout(resolve, baseDelay * (attempt + 1)));
+        }
       }
-    } catch (err) {
-      setError('Error de conexión al intentar guardar los datos.');
-      console.error(err);
-    } finally {
-      setLoading(false);
     }
+    
+    setLoading(false);
+    setSaveStatusText('Firmar y Enviar a Sheet');
   };
 
   const resetApp = () => {
@@ -111,6 +132,9 @@ export default function App() {
     setInstructorData(null);
     setAct1('');
     setAct2('');
+    setSaveStatusText('Firmar y Enviar a Sheet');
+    setLoading(false);
+    setError('');
   };
 
   return (
@@ -298,11 +322,14 @@ export default function App() {
                     className="flex-1 bg-gradient-to-r from-cyan-600 to-violet-600 hover:from-cyan-500 hover:to-violet-500 text-white font-bold py-4 px-8 rounded-xl shadow-lg hover:shadow-cyan-500/25 transition-all flex justify-center items-center gap-2"
                   >
                     {loading ? (
-                       <span className="w-5 h-5 border-2 border-white/30 border-t-white rounded-full animate-spin"></span>
+                       <>
+                         <span className="w-5 h-5 border-2 border-white/30 border-t-white rounded-full animate-spin"></span>
+                         <span className="text-sm">{saveStatusText}</span>
+                       </>
                     ) : (
                       <>
                         <ShieldCheck size={20} />
-                        Firmar y Enviar a Sheet
+                        {saveStatusText}
                       </>
                     )}
                   </button>
@@ -404,14 +431,21 @@ function doPost(e) {
     const payload = JSON.parse(e.postData.contents);
     const sheet = getActiveSheet();
     
-    // Bloqueo temporal para evitar colisiones de concurrencia
+    // Bloqueo ampliado a 30 SEGUNDOS para alta concurrencia
     const lock = LockService.getScriptLock();
-    lock.waitLock(10000); 
+    // Intenta obtener exclusividad. Si hay muchos guardando, espera en fila hasta 30 segs.
+    const success = lock.tryLock(30000); 
+    
+    if (!success) {
+      throw new Error("Lock timeout. Tráfico muy alto.");
+    }
     
     // payload requiere: rowIndex, act1, act2
     sheet.getRange(payload.rowIndex, 5).setValue(payload.act1); // Col E = Actividad 1
     sheet.getRange(payload.rowIndex, 6).setValue(payload.act2); // Col F = Actividad 2
     
+    // Forzamos a que Google Sheets escriba los cambios inmediatamente antes de liberar el cerrojo
+    SpreadsheetApp.flush(); 
     lock.releaseLock();
     
     return ContentService.createTextOutput(JSON.stringify({status: 'success'}))
